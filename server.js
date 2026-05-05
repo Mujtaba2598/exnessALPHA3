@@ -10,14 +10,17 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = 'exness-halal-fixed-secret-key-2024';
-const ENCRYPTION_KEY = '12345678901234567890123456789012'; // 32 bytes exactly
+const ENCRYPTION_KEY = '12345678901234567890123456789012';
 
 // Halal Assets (Exness supported)
 const HALAL_ASSETS = [
     'BTCUSD', 'ETHUSD', 'BNBUSD', 'SOLUSD', 'ADAUSD',
-    'XRPUSD', 'DOTUSD', 'LINKUSD', 'MATICUSD', 'AVAXUSD',
-    'EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'
+    'XRPUSD', 'DOTUSD', 'LINKUSD', 'MATICUSD', 'AVAXUSD'
 ];
+
+// ========== 50 CONCURRENT TRADES SETTING ==========
+const MAX_CONCURRENT_TRADES = 50;        // Up to 50 trades at once
+const PROFIT_CHECK_INTERVAL = 2000;      // Check every 2 seconds
 
 // ========== DATA DIRECTORIES ==========
 const DATA_DIR = path.join(__dirname, 'data');
@@ -51,7 +54,6 @@ users[ownerEmail] = {
     createdAt: new Date().toISOString()
 };
 fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-console.log("✅ Owner account created");
 
 if (!fs.existsSync(PENDING_FILE)) fs.writeFileSync(PENDING_FILE, JSON.stringify({}, null, 2));
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, JSON.stringify({}, null, 2));
@@ -86,13 +88,12 @@ function decrypt(text) {
 
 function cleanKey(k) { return k ? k.replace(/[\s\n\r\t]+/g, '').trim() : ""; }
 
-// ========== MIDDLEWARE ==========
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', message: '🕋 Halal Exness Bot Running' });
+    res.json({ status: 'ok', message: '🕋 Halal Exness Bot - 50 Concurrent Trades' });
 });
 
 // ========== AUTHENTICATION ==========
@@ -152,23 +153,16 @@ async function getExnessBalance(apiKey, secretKey, useDemo = false) {
         const timestamp = Date.now();
         const signature = crypto.createHmac('sha256', secretKey).update(timestamp + '/account/balance').digest('hex');
         const url = `${baseUrl}/account/balance?timestamp=${timestamp}&signature=${signature}`;
-        
         const response = await axios({
             method: 'GET',
             url,
             headers: { 'X-API-Key': apiKey },
             timeout: 10000
         });
-        return {
-            balance: parseFloat(response.data.balance || 0),
-            equity: parseFloat(response.data.equity || 0),
-            freeMargin: parseFloat(response.data.freeMargin || 0),
-            currency: response.data.currency || 'USD'
-        };
+        return parseFloat(response.data.balance || 0);
     } catch (error) {
         console.error('Exness balance error:', error.message);
-        // Return demo balance for testing
-        return { balance: 10000, equity: 10000, freeMargin: 10000, currency: 'USD' };
+        return 10000;
     }
 }
 
@@ -178,23 +172,20 @@ async function getExnessPrice(symbol, useDemo = false) {
         const response = await axios.get(`${baseUrl}/market/price?symbol=${symbol}`, { timeout: 10000 });
         return parseFloat(response.data.bid || response.data.price || 100);
     } catch (error) {
-        // Return default price for testing
         const defaultPrices = {
             'BTCUSD': 50000, 'ETHUSD': 3000, 'BNBUSD': 400, 'SOLUSD': 100,
             'ADAUSD': 0.5, 'XRPUSD': 0.6, 'DOTUSD': 7, 'LINKUSD': 15,
-            'MATICUSD': 0.8, 'AVAXUSD': 35, 'EURUSD': 1.08, 'GBPUSD': 1.25,
-            'USDJPY': 150, 'XAUUSD': 2000
+            'MATICUSD': 0.8, 'AVAXUSD': 35
         };
         return defaultPrices[symbol] || 100;
     }
 }
 
-async function placeExnessLimitOrder(apiKey, secretKey, symbol, side, volume, price, useDemo = false) {
+async function placeExnessOrder(apiKey, secretKey, symbol, side, volume, price, useDemo = false) {
     const baseUrl = useDemo ? EXNESS_DEMO : EXNESS_API;
     const timestamp = Date.now();
     const params = { symbol, side, type: 'LIMIT', volume, price, timestamp };
     const signature = crypto.createHmac('sha256', secretKey).update(timestamp + '/orders' + JSON.stringify(params)).digest('hex');
-    
     const response = await axios({
         method: 'POST',
         url: `${baseUrl}/orders?timestamp=${timestamp}&signature=${signature}`,
@@ -205,12 +196,24 @@ async function placeExnessLimitOrder(apiKey, secretKey, symbol, side, volume, pr
     return response.data;
 }
 
+async function checkExnessOrderStatus(apiKey, secretKey, orderId, useDemo = false) {
+    const baseUrl = useDemo ? EXNESS_DEMO : EXNESS_API;
+    const timestamp = Date.now();
+    const signature = crypto.createHmac('sha256', secretKey).update(timestamp + `/orders/${orderId}`).digest('hex');
+    const url = `${baseUrl}/orders/${orderId}?timestamp=${timestamp}&signature=${signature}`;
+    const response = await axios({
+        method: 'GET',
+        url,
+        headers: { 'X-API-Key': apiKey },
+        timeout: 10000
+    });
+    return response.data;
+}
+
 // ========== API KEY MANAGEMENT ==========
 app.post('/api/set-exness-keys', authenticate, async (req, res) => {
     let { exnessId, apiKey, secretKey, accountType } = req.body;
-    if (!apiKey || !secretKey) {
-        return res.status(400).json({ success: false, message: 'Both API keys required' });
-    }
+    if (!apiKey || !secretKey) return res.status(400).json({ success: false, message: 'Both API keys required' });
     
     const cleanApi = cleanKey(apiKey);
     const cleanSecret = cleanKey(secretKey);
@@ -223,8 +226,7 @@ app.post('/api/set-exness-keys', authenticate, async (req, res) => {
         users[req.user.email].apiKey = encrypt(cleanApi);
         users[req.user.email].secretKey = encrypt(cleanSecret);
         writeUsers(users);
-        
-        res.json({ success: true, message: `✅ API keys saved! Balance: ${balance.balance} ${balance.currency}`, balance: balance.balance });
+        res.json({ success: true, message: `✅ API keys saved! Balance: ${balance} USD`, balance: balance });
     } catch (err) {
         res.status(401).json({ success: false, message: err.message });
     }
@@ -233,9 +235,7 @@ app.post('/api/set-exness-keys', authenticate, async (req, res) => {
 app.post('/api/connect-exness', authenticate, async (req, res) => {
     const { accountType } = req.body;
     const user = readUsers()[req.user.email];
-    if (!user?.apiKey) {
-        return res.status(400).json({ success: false, message: 'No API keys saved' });
-    }
+    if (!user?.apiKey) return res.status(400).json({ success: false, message: 'No API keys saved' });
     
     const apiKey = decrypt(user.apiKey);
     const secretKey = decrypt(user.secretKey);
@@ -243,7 +243,7 @@ app.post('/api/connect-exness', authenticate, async (req, res) => {
     
     try {
         const balance = await getExnessBalance(apiKey, secretKey, useDemo);
-        res.json({ success: true, balance: balance.balance, message: `✅ Connected! Balance: ${balance.balance} ${balance.currency}` });
+        res.json({ success: true, balance, message: `✅ Connected! Balance: ${balance} USD` });
     } catch (error) {
         res.status(401).json({ success: false, message: error.message });
     }
@@ -263,16 +263,11 @@ app.post('/api/get-balance', authenticate, async (req, res) => {
     const apiKey = decrypt(user.apiKey);
     const secretKey = decrypt(user.secretKey);
     const useDemo = accountType === 'demo';
-    
-    try {
-        const balance = await getExnessBalance(apiKey, secretKey, useDemo);
-        res.json({ success: true, balance: balance.balance });
-    } catch (error) {
-        res.json({ success: false, message: error.message });
-    }
+    const balance = await getExnessBalance(apiKey, secretKey, useDemo);
+    res.json({ success: true, balance });
 });
 
-// ========== TRADING ENGINE ==========
+// ========== 50 CONCURRENT TRADES ENGINE ==========
 const activeSessions = new Map();
 let assetIndex = 0;
 
@@ -282,13 +277,19 @@ function nextAsset() {
     return asset;
 }
 
+function calculateTradeVolume(currentBalance, targetAmount, totalActiveTrades, asset) {
+    const remainingNeeded = Math.max(1, targetAmount - currentBalance);
+    const tradesCount = Math.max(1, totalActiveTrades + 1);
+    let volume = (remainingNeeded / tradesCount) / 50000;
+    volume = Math.floor(volume * 100) / 100;
+    return Math.max(0.01, volume);
+}
+
 app.post('/api/start-trading', authenticate, async (req, res) => {
     try {
         const { investmentAmount, targetAmount, timeLimitHours, accountType } = req.body;
         
-        if (!investmentAmount || !targetAmount) {
-            return res.status(400).json({ success: false, message: 'Investment and target required' });
-        }
+        if (!investmentAmount || !targetAmount) return res.status(400).json({ success: false, message: 'Investment and target required' });
         if (investmentAmount < 10) return res.status(400).json({ success: false, message: 'Minimum investment $10' });
         if (targetAmount <= investmentAmount) return res.status(400).json({ success: false, message: 'Target must be greater than investment' });
         
@@ -301,8 +302,7 @@ app.post('/api/start-trading', authenticate, async (req, res) => {
         
         let balance = 0;
         try {
-            const bal = await getExnessBalance(apiKey, secretKey, useDemo);
-            balance = bal.balance;
+            balance = await getExnessBalance(apiKey, secretKey, useDemo);
         } catch (error) {
             return res.status(401).json({ success: false, message: 'Cannot verify balance: ' + error.message });
         }
@@ -312,34 +312,147 @@ app.post('/api/start-trading', authenticate, async (req, res) => {
         }
         
         const sessionId = crypto.randomBytes(8).toString('hex');
-        const symbol = nextAsset();
-        const currentPrice = await getExnessPrice(symbol, useDemo);
-        const buyPrice = currentPrice * 0.998;
-        const volume = investmentAmount / buyPrice;
-        const roundedVolume = Math.floor(volume * 100) / 100;
         
-        const order = await placeExnessLimitOrder(apiKey, secretKey, symbol, 'BUY', roundedVolume, buyPrice, useDemo);
-        
-        activeSessions.set(sessionId, {
+        const sessionData = {
             userId: req.user.email,
             investment: investmentAmount,
             target: targetAmount,
             currentBalance: investmentAmount,
             startTime: Date.now(),
             timeLimit: timeLimitHours || 1,
-            symbol: symbol,
-            buyOrderId: order.id,
-            buyPrice: buyPrice,
-            volume: roundedVolume,
-            status: 'BUY_PLACED'
-        });
+            activeTrades: [],
+            completedTrades: [],
+            apiKey: apiKey,
+            secretKey: secretKey,
+            useDemo: useDemo,
+            status: 'ACTIVE'
+        };
         
-        res.json({ success: true, sessionId, message: `✅ BUY order placed: ${roundedVolume} ${symbol} @ ${buyPrice} USD` });
+        activeSessions.set(sessionId, sessionData);
+        
+        startConcurrentTrading(sessionId);
+        
+        res.json({ 
+            success: true, 
+            sessionId, 
+            message: `✅ HALAL TRADING STARTED!\n📊 Mode: ${useDemo ? 'DEMO' : 'REAL EXNESS'}\n💰 Investment: $${investmentAmount}\n🎯 Target: $${targetAmount}\n⏰ Time Limit: ${timeLimitHours || 1} hours\n⚡ Max Concurrent Trades: ${MAX_CONCURRENT_TRADES}\n\n🕋 ISLAMIC REMINDER: Use swap-free Islamic account. NO Riba, NO Gharar, NO Maysir, NO leverage, NO short selling.`
+        });
         
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
 });
+
+async function startConcurrentTrading(sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session || session.status !== 'ACTIVE') return;
+    
+    if (session.currentBalance >= session.target) {
+        session.status = 'TARGET_REACHED';
+        console.log(`🎯 TARGET REACHED! ${session.userId} achieved $${session.currentBalance.toFixed(2)}`);
+        activeSessions.delete(sessionId);
+        return;
+    }
+    
+    const elapsedHours = (Date.now() - session.startTime) / 3600000;
+    if (elapsedHours >= session.timeLimit) {
+        session.status = 'TIME_LIMIT_REACHED';
+        console.log(`⏰ TIME LIMIT REACHED for ${session.userId}`);
+        activeSessions.delete(sessionId);
+        return;
+    }
+    
+    // Check existing trades
+    for (let i = 0; i < session.activeTrades.length; i++) {
+        const trade = session.activeTrades[i];
+        
+        if (trade.status === 'BUY_ORDER_PLACED') {
+            try {
+                const orderStatus = await checkExnessOrderStatus(session.apiKey, session.secretKey, trade.buyOrderId, session.useDemo);
+                if (orderStatus.status === 'FILLED') {
+                    trade.status = 'BUY_FILLED';
+                    trade.fillPrice = parseFloat(orderStatus.price);
+                    console.log(`✅ Buy order filled: ${trade.volume} ${trade.symbol} @ ${trade.fillPrice}`);
+                    
+                    const sellPrice = trade.fillPrice * 1.01;
+                    const sellOrder = await placeExnessOrder(session.apiKey, session.secretKey, trade.symbol, 'SELL', trade.volume, sellPrice, session.useDemo);
+                    trade.sellOrderId = sellOrder.id;
+                    trade.sellPrice = sellPrice;
+                    trade.status = 'SELL_ORDER_PLACED';
+                } else if (orderStatus.status === 'EXPIRED' || orderStatus.status === 'CANCELED') {
+                    trade.status = 'FAILED';
+                    session.activeTrades.splice(i, 1);
+                    i--;
+                }
+            } catch (error) {
+                console.error('Order check error:', error.message);
+            }
+        } else if (trade.status === 'SELL_ORDER_PLACED') {
+            try {
+                const orderStatus = await checkExnessOrderStatus(session.apiKey, session.secretKey, trade.sellOrderId, session.useDemo);
+                if (orderStatus.status === 'FILLED') {
+                    const exitPrice = parseFloat(orderStatus.price);
+                    const profit = (exitPrice - trade.fillPrice) * trade.volume;
+                    session.currentBalance += profit;
+                    session.completedTrades.push({ ...trade, profit, exitPrice });
+                    trade.status = 'COMPLETED';
+                    console.log(`✅ Sell order filled! Profit: $${profit.toFixed(2)}. New balance: $${session.currentBalance.toFixed(2)}`);
+                    
+                    const historyFile = path.join(TRADES_DIR, session.userId.replace(/[^a-z0-9]/gi, '_') + '.json');
+                    let history = [];
+                    if (fs.existsSync(historyFile)) history = JSON.parse(fs.readFileSync(historyFile));
+                    history.unshift({
+                        symbol: trade.symbol,
+                        entryPrice: trade.fillPrice,
+                        exitPrice: exitPrice,
+                        volume: trade.volume,
+                        profit: profit,
+                        profitPercent: (profit / (trade.fillPrice * trade.volume)) * 100,
+                        timestamp: new Date().toISOString(),
+                        isHalal: true
+                    });
+                    fs.writeFileSync(historyFile, JSON.stringify(history.slice(0, 500), null, 2));
+                    
+                    session.activeTrades.splice(i, 1);
+                    i--;
+                }
+            } catch (error) {
+                console.error('Sell order check error:', error.message);
+            }
+        }
+    }
+    
+    // Place new trades
+    const tradesToPlace = Math.min(MAX_CONCURRENT_TRADES - session.activeTrades.length, 10);
+    
+    for (let i = 0; i < tradesToPlace; i++) {
+        if (session.currentBalance >= session.target) break;
+        
+        const symbol = nextAsset();
+        const currentPrice = await getExnessPrice(symbol, session.useDemo);
+        const buyPrice = currentPrice * 0.998;
+        const volume = calculateTradeVolume(session.currentBalance, session.target, session.activeTrades.length, symbol);
+        
+        if (volume < 0.01) continue;
+        
+        try {
+            const order = await placeExnessOrder(session.apiKey, session.secretKey, symbol, 'BUY', volume, buyPrice, session.useDemo);
+            session.activeTrades.push({
+                symbol: symbol,
+                volume: volume,
+                buyPrice: buyPrice,
+                buyOrderId: order.id,
+                status: 'BUY_ORDER_PLACED',
+                createdAt: Date.now()
+            });
+            console.log(`📈 New BUY order placed: ${volume} ${symbol} @ ${buyPrice} (Active trades: ${session.activeTrades.length})`);
+        } catch (error) {
+            console.error(`Failed to place order for ${symbol}:`, error.message);
+        }
+    }
+    
+    setTimeout(() => { startConcurrentTrading(sessionId); }, PROFIT_CHECK_INTERVAL);
+}
 
 app.post('/api/stop-trading', authenticate, (req, res) => {
     activeSessions.delete(req.body.sessionId);
@@ -362,7 +475,9 @@ app.post('/api/trade-status', authenticate, (req, res) => {
         totalProfit: session.currentBalance - session.investment,
         progressPercent: Math.min(100, Math.max(0, progress)),
         timeRemaining: remaining,
-        status: session.status
+        status: session.status,
+        activeTradesCount: session.activeTrades.length,
+        completedTradesCount: session.completedTrades.length
     });
 });
 
@@ -435,7 +550,7 @@ app.get('/api/admin/user-balances', authenticate, async (req, res) => {
                 const apiKey = decrypt(u.apiKey);
                 const secretKey = decrypt(u.secretKey);
                 const balance = await getExnessBalance(apiKey, secretKey, false);
-                balances[email] = { balance: balance.balance, hasKeys: true };
+                balances[email] = { balance, hasKeys: true };
             } catch { balances[email] = { balance: 0, hasKeys: true, error: true }; }
         } else {
             balances[email] = { balance: 0, hasKeys: false };
@@ -467,20 +582,21 @@ app.post('/api/change-password', authenticate, (req, res) => {
     res.json({ success: true, message: 'Password changed! Please login again.' });
 });
 
-// ========== SERVE FRONTEND ==========
+// Serve frontend
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n========================================`);
-    console.log(`🕋 HALAL EXNESS BOT - RUNNING`);
+    console.log(`🕋 HALAL EXNESS BOT - 50 CONCURRENT TRADES`);
     console.log(`========================================`);
     console.log(`✅ Owner: ${ownerEmail}`);
     console.log(`✅ Password: ${ownerPasswordPlain}`);
     console.log(`✅ ${HALAL_ASSETS.length} Halal Assets`);
-    console.log(`✅ 100% HALAL - No Riba, No Gharar, No Maysir, No Leverage`);
-    console.log(`✅ Real Exness API | Limit Orders Only`);
+    console.log(`✅ Max Concurrent Trades: ${MAX_CONCURRENT_TRADES}`);
+    console.log(`✅ 100% HALAL - Use swap-free Islamic account`);
+    console.log(`✅ No Riba, No Gharar, No Maysir, No Leverage`);
     console.log(`========================================`);
     console.log(`Server running on port: ${PORT}`);
 });
