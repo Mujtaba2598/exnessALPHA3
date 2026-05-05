@@ -1,7 +1,7 @@
 {
-  "name": "halal-exness-bot",
-  "version": "15.0.0",
-  "description": "100% Halal Exness Trading Bot - No Riba, No Gharar, No Maysir, No Leverage",
+  "name": "halal-trading-bot",
+  "version": "16.0.0",
+  "description": "100% Halal Trading Bot - 50 Concurrent Trades - No Riba, No Gharar, No Maysir, No Leverage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
