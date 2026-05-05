@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: halal-exness-bot
+    name: halal-trading-bot
     runtime: node
     plan: free
     buildCommand: npm install && mkdir -p data/trades
